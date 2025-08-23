@@ -1,0 +1,289 @@
+const std = @import("std");
+const log = @import("../utils/log.zig").log;
+
+pub const Chip8 = struct {
+    registers: [16]u8,
+    stack: [16]u16,
+    I: u16,
+    pc: u16,
+    op: u16,
+    sp: u8,
+    memory: [4096]u8,
+    display: [64 * 32]u8,
+    keypad: [16]u8,
+    delay_timer: u8,
+    sound_timer: u8,
+    draw_flag: bool,
+    rng: std.Random.DefaultPrng,
+
+    const Self = @This();
+
+    pub fn init() Chip8 {
+        log(.INFO, "Initializing Chip8", .{});
+        // chop 64bs off
+        const seed: u64 = @intCast(std.time.nanoTimestamp() & 0xFFFFFFFFFFFFFFFF);
+        return Chip8{
+            .registers = [_]u8{0x00} ** 16,
+            .stack = [_]u16{0x00} ** 16,
+            .I = 0x00,
+            .op = 0x00,
+            .pc = 0x200,
+            .sp = 0x00,
+            .memory = [_]u8{0x00} ** 4096,
+            .display = [_]u8{0x00} ** (64 * 32),
+            .keypad = [_]u8{0x00} ** 16,
+            .delay_timer = 0,
+            .sound_timer = 0,
+            .draw_flag = true,
+            .rng = std.Random.DefaultPrng.init(seed),
+        };
+    }
+
+    /// load FONTSET and ROM > memory
+    pub fn load(self: *Self, filename: []const u8, stat: std.fs.File.Stat, allocator: std.mem.Allocator) !void {
+        var inputFile = try std.fs.cwd().openFile(filename, .{});
+        defer inputFile.close();
+        log(.INFO, "Loading ROM `{s}`", .{filename});
+        log(.INFO, "ROM size: {d}", .{stat.size});
+        const reader = try inputFile.readToEndAlloc(allocator, stat.size);
+        defer allocator.free(reader);
+        self.loadFontSetInMemory();
+        var i: usize = 0;
+        while (i < stat.size) : (i += 1) {
+            self.memory[i + 0x200] = reader[i];
+        }
+    }
+
+    fn loadFontSetInMemory(self: *Self) void {
+        const fontset = [80]u8{
+            0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+            0x20, 0x60, 0x20, 0x20, 0x70, // 1
+            0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+            0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+            0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+            0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+            0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+            0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+            0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+            0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+            0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+            0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+            0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+            0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+            0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+            0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+        };
+
+        log(.INFO, "Loading fontset into memory", .{});
+        for (fontset, 0..) |value, i| {
+            self.memory[i] = value;
+        }
+        log(.INFO, "Fontset loaded successfully", .{});
+    }
+
+    fn getRandomByte0to255(self: *Self) u8 {
+        return self.rng.random().int(u8);
+    }
+
+    fn incrementPC(self: *Self) void {
+        self.pc += 2;
+    }
+
+    fn skipNextInstruction(self: *Self) void {
+        self.pc += 4;
+    }
+
+    fn jumpToAddress(self: *Self, address: u16) void {
+        self.pc = address;
+    }
+
+    pub fn cycle(self: *Self) void {
+        if (self.pc > 0xFFF) {
+            log(.ERROR, "Program counter overflow", .{});
+            return;
+        }
+        self.op = (@as(u16, self.memory[self.pc]) << 8) | self.memory[self.pc + 1];
+        self.execute(self.op);
+    }
+
+    fn execute(self: *Self, op: u16) void {
+        const x: usize = @intCast((op & 0x0F00) >> 8);
+        const y: usize = @intCast((op & 0x00F0) >> 4);
+        const n: u8 = @truncate(op & 0x000F);
+        const nn: u8 = @truncate(op & 0x00FF);
+        const nnn: u16 = op & 0x0FFF;
+
+        switch (op & 0xF000) {
+            0x0000 => switch (op) {
+                0x00E0 => { // CLS
+                    for (&self.display) |*px| px.* = 0;
+                    self.draw_flag = true;
+                    self.incrementPC();
+                },
+                0x00EE => { // RET
+                    self.sp -= 1;
+                    self.pc = self.stack[self.sp];
+                    self.incrementPC();
+                },
+                else => self.incrementPC(), // SYS (ignored)
+            },
+            0x1000 => self.jumpToAddress(nnn), // JP addr
+            0x2000 => { // CALL addr
+                self.stack[self.sp] = self.pc;
+                self.sp += 1;
+                self.jumpToAddress(nnn);
+            },
+            0x3000 => { // SE Vx byte
+                if (self.registers[x] == nn) self.skipNextInstruction();
+                self.incrementPC();
+            },
+            0x4000 => { // SNE Vx byte
+                if (self.registers[x] != nn) self.skipNextInstruction();
+                self.incrementPC();
+            },
+            0x5000 => { // SE Vx Vy
+                if (self.registers[x] == self.registers[y]) self.skipNextInstruction();
+                self.incrementPC();
+            },
+            0x6000 => { // LD Vx byte
+                self.registers[x] = nn;
+                self.incrementPC();
+            },
+            0x7000 => { // ADD Vx byte
+                @setRuntimeSafety(false);
+                self.registers[x] +%= nn;
+                self.incrementPC();
+            },
+            0x8000 => {
+                switch (n) {
+                    0x0 => self.registers[x] = self.registers[y], // LD
+                    0x1 => self.registers[x] |= self.registers[y], // OR
+                    0x2 => self.registers[x] &= self.registers[y], // AND
+                    0x3 => self.registers[x] ^= self.registers[y], // XOR
+                    0x4 => { // ADD
+                        const sum: u16 = @as(u16, self.registers[x]) + @as(u16, self.registers[y]);
+                        self.registers[0xF] = if (sum > 0xFF) 1 else 0;
+                        self.registers[x] = @truncate(sum);
+                    },
+                    0x5 => { // SUB
+                        self.registers[0xF] = if (self.registers[x] > self.registers[y]) 1 else 0;
+                        self.registers[x] -%= self.registers[y];
+                    },
+                    0x6 => { // SHR
+                        self.registers[0xF] = self.registers[x] & 0x01;
+                        self.registers[x] >>= 1;
+                    },
+                    0x7 => { // SUBN
+                        self.registers[0xF] = if (self.registers[y] > self.registers[x]) 1 else 0;
+                        self.registers[x] = self.registers[y] -% self.registers[x];
+                    },
+                    0xE => { // SHL
+                        self.registers[0xF] = (self.registers[x] >> 7) & 1;
+                        self.registers[x] <<= 1;
+                    },
+                    else => {},
+                }
+                self.incrementPC();
+            },
+            0x9000 => { // SNE Vx Vy
+                if (self.registers[x] != self.registers[y]) self.skipNextInstruction();
+                self.incrementPC();
+            },
+            0xA000 => { // LD I addr
+                self.I = nnn;
+                self.incrementPC();
+            },
+            0xB000 => self.jumpToAddress(nnn + self.registers[0]), // JP V0, addr
+            0xC000 => { // RND Vx
+                const r = self.getRandomByte0to255();
+                self.registers[x] = r & nn;
+                self.incrementPC();
+            },
+            0xD000 => { // DRW Vx Vy N
+                const regX: usize = @intCast(self.registers[x]);
+                const regY: usize = @intCast(self.registers[y]);
+                self.registers[0xF] = 0;
+
+                var row: usize = 0;
+                while (row < n) : (row += 1) {
+                    const spriteByte = self.memory[self.I + row];
+                    var col: u8 = 0;
+                    while (col < 8) : (col += 1) {
+                        const mask: u8 = @as(u8, 0x80) >> @intCast(col);
+                        if ((spriteByte & mask) != 0) {
+                            // draw pixel
+                            const px = (regX + col) % 64;
+                            const py = (regY + row) % 32;
+                            const idx = py * 64 + px;
+                            if (self.display[idx] == 1) self.registers[0xF] = 1;
+                            self.display[idx] ^= 1;
+                        }
+                    }
+                }
+
+                self.draw_flag = true;
+                self.incrementPC();
+            },
+            0xE000 => switch (op & 0x00FF) {
+                0x9E => { // SKP
+                    if (self.keypad[self.registers[x]] != 0) self.skipNextInstruction();
+                    self.incrementPC();
+                },
+                0xA1 => { // SKNP
+                    if (self.keypad[self.registers[x]] == 0) self.skipNextInstruction();
+                    self.incrementPC();
+                },
+                else => self.incrementPC(),
+            },
+            0xF000 => switch (op & 0x00FF) {
+                0x07 => {
+                    self.registers[x] = self.delay_timer;
+                    self.incrementPC();
+                },
+                0x0A => { // LD Vx K (wait for key)
+                    // TODO: blocking key wait
+                    self.incrementPC();
+                },
+                0x15 => {
+                    self.delay_timer = self.registers[x];
+                    self.incrementPC();
+                },
+                0x18 => {
+                    self.sound_timer = self.registers[x];
+                    self.incrementPC();
+                },
+                0x1E => {
+                    self.I +%= self.registers[x];
+                    self.incrementPC();
+                },
+                0x29 => {
+                    self.I = self.registers[x] * 5;
+                    self.incrementPC();
+                }, // font
+                0x33 => { // BCD
+                    const val = self.registers[x];
+                    self.memory[self.I] = val / 100;
+                    self.memory[self.I + 1] = (val / 10) % 10;
+                    self.memory[self.I + 2] = val % 10;
+                    self.incrementPC();
+                },
+                0x55 => { // store V0..Vx into memory
+                    var i: usize = 0;
+                    while (i <= x) : (i += 1) {
+                        self.memory[self.I + i] = self.registers[i];
+                    }
+                    self.incrementPC();
+                },
+                0x65 => { // load V0..Vx from memory
+                    var i: usize = 0;
+                    while (i <= x) : (i += 1) {
+                        self.registers[i] = self.memory[self.I + i];
+                    }
+                    self.incrementPC();
+                },
+                else => self.incrementPC(),
+            },
+            else => self.incrementPC(),
+        }
+    }
+};

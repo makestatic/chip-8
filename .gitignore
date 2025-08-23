@@ -1,0 +1,4 @@
+/zig-out/
+*.log
+/.zig-cache/
+build.zig.zon
