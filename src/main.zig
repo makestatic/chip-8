@@ -2,7 +2,6 @@ const std = @import("std");
 const CPU = @import("chip/chip.zig").Chip8;
 const log = @import("utils/log.zig").log;
 const process = std.process;
-const os = std.os;
 
 const c = @cImport({
     @cInclude("termios.h");
@@ -10,13 +9,17 @@ const c = @cImport({
 });
 
 var FIRST_RUN = true;
+var OPCODES_PER_FRAME = 64;
 
+// https://en.wikipedia.org/wiki/CHIP-8#Keyboard
 const keymap: [16]u8 = [_]u8{
     '1', '2', '3', '4',
     'q', 'w', 'e', 'r',
     'a', 's', 'd', 'f',
     'z', 'x', 'c', 'v',
 };
+
+var prev_display: [64 * 32]u8 = [_]u8{0} ** (64 * 32);
 
 var tty_file: ?std.fs.File = null;
 var orig_term: c.termios = undefined;
@@ -39,38 +42,60 @@ pub fn enableRawMode() !void {
     }
 }
 
-pub fn disableRawMode() void {
+pub fn disableRawMode() !void {
     if (tty_file) |tty| {
+        defer tty.close();
+
         _ = c.tcsetattr(tty.handle, c.TCSAFLUSH, &orig_term);
-        tty.close();
+        const so = tty.writer(&.{});
+        const stdout = so.file;
+        // show cursor
+        try stdout.writeAll("\x1b[?25h");
         tty_file = null;
     }
 }
 
-pub fn handleKeys(system: *CPU) void {
-    var buf: [16]u8 = undefined;
-    const n = c.read(c.STDIN_FILENO, &buf, buf.len);
+pub fn handleKeys(system: *CPU) !void {
+    // clear frame state
+    var frame_state: [16]bool = [_]bool{false} ** 16;
 
-    if (n > 0) {
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const pressed = buf[i];
+    if (tty_file) |tty| {
+        var buf: [32]u8 = undefined;
+        const n = c.read(tty.handle, &buf, buf.len);
 
-            // quit
-            if (pressed == 'q') {
-                disableRawMode();
-                std.process.exit(0);
+        if (n > 0) {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const pressed = buf[i];
+
+                if (pressed == 'q') {
+                    try disableRawMode();
+                    process.exit(0);
+                }
+
+                var j: usize = 0;
+                while (j < 16) : (j += 1) {
+                    if (keymap[j] == pressed) {
+                        frame_state[j] = true;
+                    }
+                }
             }
+        }
 
-            // update key states
-            var j: usize = 0;
-            while (j < 16) : (j += 1) {
-                if (keymap[j] == pressed) {
+        // update CPU key states
+        var j: usize = 0;
+        while (j < 16) : (j += 1) {
+            if (frame_state[j]) {
+                if (!system.keypad_state[j]) {
                     system.keypad_pressed[j] = 1;
                     system.keypad_handled[j] = false;
-                    // key is down
-                    system.keypad_state[j] = true;
+                } else {
+                    system.keypad_pressed[j] = 0;
                 }
+                system.keypad_state[j] = true;
+            } else {
+                system.keypad_state[j] = false;
+                system.keypad_pressed[j] = 0;
             }
         }
     }
@@ -82,30 +107,31 @@ pub fn render(system: *CPU) !void {
         const stdout = so.file;
 
         if (FIRST_RUN) {
-            try stdout.writeAll("\x1b[2J\x1b[H");
+            // clear screen and hide cursor
+            try stdout.writeAll("\x1b[2J\x1b[?25l");
             FIRST_RUN = false;
-        } else {
-            try stdout.writeAll("\x1b[H");
         }
 
-        // display
         var y: usize = 0;
         while (y < 32) : (y += 1) {
             var x: usize = 0;
             while (x < 64) : (x += 1) {
-                try stdout.writeAll(if (system.display[y * 64 + x] != 0) "█" else " ");
-            }
-            try stdout.writeAll("\n");
-        }
+                const idx = y * 64 + x;
+                const pixel = system.display[idx];
+                if (pixel != prev_display[idx]) {
+                    prev_display[idx] = pixel;
 
-        // debug pressed keys (max 1)
-        try stdout.writeAll("\nKeys: ");
-        var count: usize = 0;
-        var i: usize = 0;
-        while (i < 16 and count < 1) : (i += 1) {
-            if (system.keypad_pressed[i] != 0) {
-                log(.INFO, "{c} ", .{keymap[i]});
-                count += 1;
+                    // Move cursor: row = y+1, col = x+1
+                    var buf: [32]u8 = undefined;
+                    const len = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 });
+                    try stdout.writeAll(buf[0..len.len]);
+
+                    if (pixel != 0) {
+                        try stdout.writeAll("█");
+                    } else {
+                        try stdout.writeAll(" ");
+                    }
+                }
             }
         }
     }
@@ -137,18 +163,8 @@ pub fn main() !void {
         }
     };
 
-    if (stat.kind != .file) {
-        log(.ERROR, "ROM `{s}` is not a file", .{filename});
-        return;
-    }
-
-    if (stat.size >= 4096) {
-        log(.ERROR, "ROM `{s}` is too large", .{filename});
-        return;
-    }
-
-    if (stat.size == 0) {
-        log(.ERROR, "ROM `{s}` is empty", .{filename});
+    if (stat.kind != .file or stat.size == 0 or stat.size >= 4096) {
+        log(.ERROR, "Invalid ROM `{s}`", .{filename});
         return;
     }
 
@@ -159,17 +175,46 @@ pub fn main() !void {
     };
 
     try enableRawMode();
-    defer disableRawMode();
+
+    // ~60Hz
+    const tick_ns: u64 = 16_666_666;
+    var last_tick = std.time.nanoTimestamp();
 
     while (true) {
-        cpu.cycle();
-        handleKeys(&cpu);
+        var i: usize = 0;
+        while (i < OPCODES_PER_FRAME) : (i += 1) {
+            cpu.cycle();
+        }
+
+        try handleKeys(&cpu);
+
         if (cpu.draw_flag) {
             try render(&cpu);
             cpu.draw_flag = false;
         }
 
-        // 60hz
-        std.Thread.sleep(16_666_666);
+        // Tick
+        const now = std.time.nanoTimestamp();
+        if (now - last_tick >= tick_ns) {
+            if (cpu.delay_timer > 0) {
+                cpu.delay_timer -= 1;
+            }
+            if (cpu.sound_timer > 0) {
+                if (tty_file) |tty| {
+                    const so = tty.writer(&.{});
+                    const stdout = so.file;
+                    // BEEP
+                    // some terminals may not support this
+                    // TODO: a better cross-platform impl
+                    try stdout.writeAll("\x07");
+                }
+                cpu.sound_timer -= 1;
+            }
+            last_tick = now;
+        }
+
+        std.Thread.sleep(1_000_000); // 1ms
     }
+
+    try disableRawMode();
 }
