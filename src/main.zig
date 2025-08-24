@@ -9,6 +9,8 @@ const c = @cImport({
     @cInclude("unistd.h");
 });
 
+var FIRST_RUN = true;
+
 const keymap: [16]u8 = [_]u8{
     '1', '2', '3', '4',
     'q', 'w', 'e', 'r',
@@ -30,7 +32,7 @@ pub fn enableRawMode() !void {
     var raw = orig_term;
     raw.c_lflag &= ~(@as(c_uint, c.ICANON) | @as(c_uint, c.ECHO));
     raw.c_cc[c.VMIN] = 0;
-    raw.c_cc[c.VTIME] = 1;
+    raw.c_cc[c.VTIME] = 0;
 
     if (c.tcsetattr(tty.handle, c.TCSAFLUSH, &raw) != 0) {
         return error.TermiosFailed;
@@ -46,25 +48,30 @@ pub fn disableRawMode() void {
 }
 
 pub fn handleKeys(system: *CPU) void {
-    // Clear keypad each frame
-    for (&system.keypad) |*k| k.* = 0;
+    var buf: [16]u8 = undefined;
+    const n = c.read(c.STDIN_FILENO, &buf, buf.len);
 
-    var buf: [1]u8 = undefined;
-    while (true) {
-        const n = c.read(c.STDIN_FILENO, &buf, 1);
-        if (n <= 0) break;
-
-        const pressed = buf[0];
+    if (n > 0) {
         var i: usize = 0;
-        while (i < 16) : (i += 1) {
-            if (keymap[i] == pressed) {
-                system.keypad[i] = 1;
-            }
-        }
+        while (i < n) : (i += 1) {
+            const pressed = buf[i];
 
-        if (pressed == 'q') {
-            disableRawMode();
-            std.process.exit(0);
+            // quit
+            if (pressed == 'q') {
+                disableRawMode();
+                std.process.exit(0);
+            }
+
+            // update key states
+            var j: usize = 0;
+            while (j < 16) : (j += 1) {
+                if (keymap[j] == pressed) {
+                    system.keypad_pressed[j] = 1;
+                    system.keypad_handled[j] = false;
+                    // key is down
+                    system.keypad_state[j] = true;
+                }
+            }
         }
     }
 }
@@ -73,27 +80,32 @@ pub fn render(system: *CPU) !void {
     if (tty_file) |tty| {
         const so = tty.writer(&.{});
         const stdout = so.file;
-        try stdout.writeAll("\x1b[H"); // reset cursor
 
+        if (FIRST_RUN) {
+            try stdout.writeAll("\x1b[2J\x1b[H");
+            FIRST_RUN = false;
+        } else {
+            try stdout.writeAll("\x1b[H");
+        }
+
+        // display
         var y: usize = 0;
         while (y < 32) : (y += 1) {
             var x: usize = 0;
             while (x < 64) : (x += 1) {
-                if (system.display[y * 64 + x] == 1) {
-                    try stdout.writeAll("█");
-                } else {
-                    try stdout.writeAll(" ");
-                }
+                try stdout.writeAll(if (system.display[y * 64 + x] != 0) "█" else " ");
             }
             try stdout.writeAll("\n");
         }
 
-        // Debug keypad state
+        // debug pressed keys (max 1)
         try stdout.writeAll("\nKeys: ");
+        var count: usize = 0;
         var i: usize = 0;
-        while (i < 16) : (i += 1) {
-            if (system.keypad[i] == 1) {
-                log(.INFO, "[{d}:{c}] ", .{ i, keymap[i] });
+        while (i < 16 and count < 1) : (i += 1) {
+            if (system.keypad_pressed[i] != 0) {
+                log(.INFO, "{c} ", .{keymap[i]});
+                count += 1;
             }
         }
     }
