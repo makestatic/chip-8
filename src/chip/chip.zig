@@ -16,8 +16,8 @@ pub const Chip8 = struct {
     display: [64 * 32]u8,
     keypad: [16]u8,
     keypad_pressed: [16]u8, // edge-triggered key presses
-    keypad_handled: [16]bool, // whether CPU already read it
-    keypad_state: [16]bool, // key is physically down
+    keypad_handled: [16]bool, // cpu already read it
+    keypad_state: [16]bool, // key is pressed
     delay_timer: u8,
     sound_timer: u8,
     draw_flag: bool,
@@ -91,7 +91,7 @@ pub const Chip8 = struct {
 
         log(.INFO, "Loading fontset into memory", .{});
         for (fontset, 0..) |value, i| {
-            self.memory[i] = value;
+            self.memory[0x50 + i] = value;
         }
         log(.INFO, "Fontset loaded successfully", .{});
     }
@@ -152,7 +152,7 @@ pub const Chip8 = struct {
             // std.process.exit(1);
             return;
         }
-        // fetch 2-byte opcode
+
         self.op = (@as(u16, self.memory[self.pc]) << 8) | self.memory[self.pc + 1];
         self.execute(self.op);
     }
@@ -172,6 +172,11 @@ pub const Chip8 = struct {
                     self.incrementPC();
                 },
                 0x00EE => { // RET
+                    if (self.sp == 0) {
+                        self.halted = true;
+                        return;
+                    }
+
                     self.sp -= 1;
                     self.pc = self.stack[self.sp];
                     self.incrementPC();
@@ -180,6 +185,11 @@ pub const Chip8 = struct {
             },
             0x1000 => self.jumpToAddress(nnn), // JP addr
             0x2000 => { // CALL addr
+                if (self.sp >= 16) {
+                    self.halted = true;
+                    return;
+                }
+
                 self.stack[self.sp] = self.pc;
                 self.sp += 1;
                 self.jumpToAddress(nnn);
@@ -276,76 +286,92 @@ pub const Chip8 = struct {
                 self.incrementPC();
             },
             0xE000 => switch (op & 0x00FF) {
-                0x9E => { // SKP
-                    if (self.keypad[self.registers[x]] != 0) self.skipNextInstruction();
+                0x9E => { // SKP Vx
+                    if (self.keypad_state[self.registers[x]]) {
+                        self.skipNextInstruction();
+                    }
                     self.incrementPC();
                 },
-                0xA1 => { // SKNP
-                    if (self.keypad[self.registers[x]] == 0) self.skipNextInstruction();
+                0xA1 => { // SKNP Vx
+                    if (!self.keypad_state[self.registers[x]]) {
+                        self.skipNextInstruction();
+                    }
                     self.incrementPC();
                 },
                 else => self.incrementPC(),
             },
             0xF000 => switch (op & 0x00FF) {
-                0x07 => {
+                0x07 => { // LD Vx DT
                     self.registers[x] = self.delay_timer;
                     self.incrementPC();
                 },
-                0x0A => { // LD Vx, K (wait for key)
-                    var key_found = false;
+                0x0A => { // LD Vx, K
                     var i: usize = 0;
                     while (i < 16) : (i += 1) {
-                        if (self.keypad_pressed[i] != 0) {
+                        if (self.keypad_pressed[i] != 0 and !self.keypad_handled[i]) {
                             self.registers[x] = @intCast(i);
                             self.keypad_handled[i] = true;
-                            self.keypad_pressed[i] = 0; // reset
-                            key_found = true;
+                            self.incrementPC();
                             break;
                         }
                     }
-                    // only increment after a key is pressed
-                    if (key_found) {
-                        self.incrementPC();
-                    }
                 },
-                0x15 => {
+                0x15 => { // LD DT Vx
                     self.delay_timer = self.registers[x];
                     self.incrementPC();
                 },
-                0x18 => {
+                0x18 => { // LD ST Vx
                     self.sound_timer = self.registers[x];
                     self.incrementPC();
                 },
-                0x1E => {
-                    self.I +%= self.registers[x];
+                0x1E => { // ADD I Vx
+                    const sum: u16 = self.I + @as(u16, self.registers[x]);
+                    self.I = sum;
                     self.incrementPC();
                 },
-                0x29 => {
-                    self.I = self.registers[x] * 5;
-                    self.incrementPC();
-                }, // font
-                0x33 => { // BCD
-                    const val = self.registers[x];
-                    self.memory[self.I] = val / 100;
-                    self.memory[self.I + 1] = (val / 10) % 10;
-                    self.memory[self.I + 2] = val % 10;
+                0x29 => { // LD F Vx  (I = font sprite for digit in Vx)
+                    const digit: u8 = self.registers[x] & 0x0F;
+                    self.I = 0x50 + @as(u16, digit) * 5;
                     self.incrementPC();
                 },
-                0x55 => { // store V0..Vx into memory
-                    var i: usize = 0;
-                    while (i <= x) : (i += 1) {
-                        self.memory[self.I + i] = self.registers[i];
+                0x33 => { // LD B Vx  (BCD of Vx -> memory[I..I+2])
+                    const val: u8 = self.registers[x];
+                    const hundreds: u8 = val / 100;
+                    const tens: u8 = (val % 100) / 10;
+                    const ones: u8 = val % 10;
+
+                    if (self.I + 2 < self.memory.len) {
+                        self.memory[self.I] = hundreds;
+                        self.memory[self.I + 1] = tens;
+                        self.memory[self.I + 2] = ones;
                     }
                     self.incrementPC();
                 },
-                0x65 => { // load V0..Vx from memory
-                    var i: usize = 0;
-                    while (i <= x) : (i += 1) {
-                        self.registers[i] = self.memory[self.I + i];
+                0x55 => { // LD [I] V0..Vx  (store)
+                    var ireg: u16 = self.I;
+                    var r: usize = 0;
+                    while (r <= x and ireg < self.memory.len) : ({
+                        ireg += 1;
+                        r += 1;
+                    }) {
+                        self.memory[ireg] = self.registers[r];
                     }
                     self.incrementPC();
                 },
-                else => self.incrementPC(),
+                0x65 => { // LD V0..Vx [I]  (load)
+                    var ireg: u16 = self.I;
+                    var r: usize = 0;
+                    while (r <= x and ireg < self.memory.len) : ({
+                        ireg += 1;
+                        r += 1;
+                    }) {
+                        self.registers[r] = self.memory[ireg];
+                    }
+                    self.incrementPC();
+                },
+                else => {
+                    self.incrementPC();
+                },
             },
             else => self.incrementPC(),
         }
