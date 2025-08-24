@@ -1,6 +1,10 @@
 const std = @import("std");
 const log = @import("../utils/log.zig").log;
 
+// Handled instructions:
+
+const MAX_TRYING = 4;
+
 pub const Chip8 = struct {
     registers: [16]u8,
     stack: [16]u16,
@@ -11,10 +15,16 @@ pub const Chip8 = struct {
     memory: [4096]u8,
     display: [64 * 32]u8,
     keypad: [16]u8,
+    keypad_pressed: [16]u8, // edge-triggered key presses
+    keypad_handled: [16]bool, // whether CPU already read it
+    keypad_state: [16]bool, // key is physically down
     delay_timer: u8,
     sound_timer: u8,
     draw_flag: bool,
     rng: std.Random.DefaultPrng,
+    halted: bool,
+    // detect infinite loops
+    trying: u8,
 
     const Self = @This();
 
@@ -32,10 +42,15 @@ pub const Chip8 = struct {
             .memory = [_]u8{0x00} ** 4096,
             .display = [_]u8{0x00} ** (64 * 32),
             .keypad = [_]u8{0x00} ** 16,
+            .keypad_pressed = [_]u8{0x00} ** 16,
+            .keypad_handled = [_]bool{false} ** 16,
+            .keypad_state = [_]bool{false} ** 16,
             .delay_timer = 0,
             .sound_timer = 0,
             .draw_flag = true,
             .rng = std.Random.DefaultPrng.init(seed),
+            .halted = false,
+            .trying = 0,
         };
     }
 
@@ -85,23 +100,59 @@ pub const Chip8 = struct {
         return self.rng.random().int(u8);
     }
 
-    fn incrementPC(self: *Self) void {
-        self.pc += 2;
+    /// increment program counter
+    /// if program counter overflows: > 0xFFF, reset to 0x200
+    fn incrementPC(self: *Chip8) void {
+        if (self.pc + 2 >= 0xFFF) {
+            log(.ERROR, "Program counter overflow (call: incrementPC): {x}, resetting..", .{self.pc});
+            if (self.trying >= MAX_TRYING) {
+                self.halted = true;
+                return;
+            }
+            self.trying += 1;
+            self.pc = 0x200;
+        } else {
+            self.pc += 2;
+        }
     }
 
     fn skipNextInstruction(self: *Self) void {
-        self.pc += 4;
+        if (self.pc + 4 >= 0xFFF) {
+            log(.ERROR, "Program counter overflow (call: skipNextInstruction): {x}, try last safe instruction..", .{self.pc});
+            if (self.trying >= MAX_TRYING) {
+                self.halted = true;
+                return;
+            }
+            self.trying += 1;
+            self.pc = 0xFFE; // last valid instruction
+        } else {
+            self.pc += 4;
+        }
     }
 
     fn jumpToAddress(self: *Self, address: u16) void {
+        if (address >= 0xFFF) {
+            log(.ERROR, "Address out of bounds: {x}", .{address});
+            // halt
+            self.halted = true;
+            return;
+        }
         self.pc = address;
     }
 
     pub fn cycle(self: *Self) void {
-        if (self.pc > 0xFFF) {
-            log(.ERROR, "Program counter overflow", .{});
+        if (self.halted) {
+            log(.INFO, "CPU Halted...... EXITING.", .{});
+            std.process.exit(0);
+        }
+        // safty check
+        if (self.pc + 1 >= 0x1000) { // = 4096
+            log(.ERROR, "PC overflow (call: cycle): {x}, exiting..;", .{self.pc});
+            self.halted = true;
+            // std.process.exit(1);
             return;
         }
+        // fetch 2-byte opcode
         self.op = (@as(u16, self.memory[self.pc]) << 8) | self.memory[self.pc + 1];
         self.execute(self.op);
     }
@@ -240,9 +291,22 @@ pub const Chip8 = struct {
                     self.registers[x] = self.delay_timer;
                     self.incrementPC();
                 },
-                0x0A => { // LD Vx K (wait for key)
-                    // TODO: blocking key wait
-                    self.incrementPC();
+                0x0A => { // LD Vx, K (wait for key)
+                    var key_found = false;
+                    var i: usize = 0;
+                    while (i < 16) : (i += 1) {
+                        if (self.keypad_pressed[i] != 0) {
+                            self.registers[x] = @intCast(i);
+                            self.keypad_handled[i] = true;
+                            self.keypad_pressed[i] = 0; // reset
+                            key_found = true;
+                            break;
+                        }
+                    }
+                    // only increment after a key is pressed
+                    if (key_found) {
+                        self.incrementPC();
+                    }
                 },
                 0x15 => {
                     self.delay_timer = self.registers[x];
